@@ -53,8 +53,9 @@ createApp({
     const user=ref(localStorage.getItem('contractlab_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
     const contracts=ref([]), batches=ref([]), buffers=ref([]), recon=ref({});
+    const activeFormal=ref({}), dualActive=ref(false), policy=ref({}), ptrMsg=ref(''), batchDetail=ref('');
     const form=ref({subject:'订单入站', payload_fields:'order_id,amount'});
-    const nav=['契约版本','入站校验','双写缓冲','契约对账'];
+    const nav=['契约版本','入站校验','双写缓冲','契约对账','策略附页'];
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
     async function login(){
       err.value='';
@@ -75,12 +76,27 @@ createApp({
       if(!token.value) return;
       const c=await loadJson('/api/contracts'); if(c===null) return;
       contracts.value=Array.isArray(c.items)?c.items:[];
+      activeFormal.value=c.active_formal||{}; dualActive.value=!!c.dual_active;
       const b=await loadJson('/api/ingress'); if(b===null) return;
       batches.value=Array.isArray(b.items)?b.items:[];
       const u=await loadJson('/api/buffers'); if(u===null) return;
       buffers.value=Array.isArray(u.items)?u.items:[];
       const q=await loadJson('/api/reconcile'); if(q===null) return;
       recon.value=q&&typeof q==='object'?q:{};
+      const p=await loadJson('/api/policy'); if(p===null) return;
+      policy.value=p&&typeof p==='object'?p:{};
+    }
+    async function rollback(c){
+      ptrMsg.value='';
+      const r=await fetch('/api/contracts/rollback',{method:'POST',headers:auth(),body:JSON.stringify({subject:c.subject,target_version:c.version})});
+      const j=await r.json().catch(()=>({}));
+      ptrMsg.value=r.ok?('已按甲路径回滚：事务内停用 '+(j.from_version||'无')+' 并启用 '+j.to_version+'，正式指针唯一'):(j.detail||'回滚失败');
+      await refresh();
+    }
+    async function showDetail(b){
+      batchDetail.value='';
+      const j=await loadJson('/api/ingress/'+b.id); if(j===null||!j.item) return;
+      batchDetail.value='#'+b.id+' 按 '+j.contract_version+' 裁；当前正式指针 '+(j.current_pointer||'无')+(j.is_current_pointer?'（仍认此版）':'（指针已切走）');
     }
     async function validate(){
       actionErr.value='';
@@ -89,7 +105,8 @@ createApp({
       await refresh();
     }
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,contracts,batches,buffers,recon,form,actionErr,login,logout,validate};
+    return {token,user,username,password,err,tab,nav,contracts,batches,buffers,recon,form,actionErr,login,logout,validate,
+      activeFormal,dualActive,policy,ptrMsg,batchDetail,rollback,showDetail};
   },
   template:`
   <div v-if="!token" class="login">
@@ -109,10 +126,16 @@ createApp({
     <div class="steps"><button v-for="(n,i) in nav" :key="n" :class="{on:tab===i}" @click="tab=i">{{i+1}}. {{n}}</button></div>
     <div class="card" v-show="tab===0">
       <h2>现行契约</h2>
-      <table><thead><tr><th>版本</th><th>主题</th><th>模式 / 轨</th><th>状态</th><th>必填字段</th></tr></thead>
+      <p v-if="dualActive" class="err">警告：检测到双正式，入站已拒裁，请查策略附页。</p>
+      <table><thead><tr><th>版本</th><th>主题</th><th>模式 / 轨</th><th>状态</th><th>必填字段</th><th>正式指针 / 回滚</th></tr></thead>
       <tbody><tr v-for="c in contracts" :key="c.id">
         <td>{{c.version}}</td><td>{{c.subject}}</td><td>{{c.mode}} / {{c.track}}</td><td>{{c.status}}</td><td>{{c.required_fields}}</td>
+        <td>
+          <span v-if="activeFormal[c.subject]===c.version" class="stamp">当前指针</span>
+          <button v-if="c.track==='正式' && c.status!=='启用'" class="ghost" @click="rollback(c)">回滚到此版</button>
+        </td>
       </tr></tbody></table>
+      <div class="err">{{ptrMsg}}</div>
     </div>
     <div class="pair" v-show="tab===1">
       <div class="card">
@@ -124,12 +147,14 @@ createApp({
       </div>
       <div class="card">
         <h2>最近批次</h2>
-        <table><thead><tr><th>批次</th><th>结果</th><th>说明</th></tr></thead>
+        <table><thead><tr><th>批次</th><th>结果</th><th>说明</th><th>详情</th></tr></thead>
         <tbody><tr v-for="b in (batches||[]).slice(0,8)" :key="b.id">
           <td>#{{b.id}} {{b.subject}}</td>
           <td><span class="stamp" :class="{bad:b.result!=='通过'}">{{b.result}}</span></td>
           <td>{{b.detail}}</td>
+          <td><button class="ghost" @click="showDetail(b)">详情</button></td>
         </tr></tbody></table>
+        <div class="meta">{{batchDetail}}</div>
       </div>
     </div>
     <div class="card" v-show="tab===2">
@@ -140,6 +165,28 @@ createApp({
     <div class="card" v-show="tab===3">
       <h2>契约对账摘要</h2>
       <p>入站 {{recon.ingress_total}} · 通过 {{recon.passed}} · 缓冲 {{recon.buffered}} · 拒收 {{recon.rejected}} · 缓冲行 {{recon.buffer_rows}} · 对齐 {{recon.aligned}}</p>
+      <p class="meta">正式指针（只认一正式）：<span v-for="(v,s) in activeFormal" :key="s">{{s}} → {{v}}　</span><span v-if="dualActive" class="err">存在双正式！</span></p>
+    </div>
+    <div class="card" v-show="tab===4">
+      <h2>策略附页 · 回滚双活册</h2>
+      <p v-if="policy.register">路径 {{policy.register.path}} · 选定 {{policy.register.decided_on}} · {{policy.register.note}}</p>
+      <p v-if="!policy.register_ok" class="err">回滚双活册缺失或被改，回滚将被拒绝并记双活偏了。</p>
+      <ul><li v-for="r in (policy.rules||[])" :key="r">{{r}}</li></ul>
+      <h2>回滚链路</h2>
+      <table><thead><tr><th>#</th><th>主题</th><th>从</th><th>到</th><th>时间</th></tr></thead>
+      <tbody><tr v-for="e in (policy.rollback_events||[])" :key="e.id">
+        <td>{{e.id}}</td><td>{{e.subject}}</td><td>{{e.from_version||'—'}}</td><td>{{e.to_version}}</td><td>{{e.created_at}}</td>
+      </tr></tbody></table>
+      <h2>争用（回滚入站抢写排队，后到者记一条）</h2>
+      <table><thead><tr><th>#</th><th>争用</th><th>后到</th><th>持闸</th><th>时间</th></tr></thead>
+      <tbody><tr v-for="e in (policy.contentions||[])" :key="e.id">
+        <td>{{e.id}}</td><td>{{e.kind}}</td><td>{{e.waiter}}</td><td>{{e.holder}}</td><td>{{e.created_at}}</td>
+      </tr></tbody></table>
+      <h2>双活偏了</h2>
+      <table><thead><tr><th>#</th><th>标记</th><th>说明</th><th>时间</th></tr></thead>
+      <tbody><tr v-for="e in (policy.deviations||[])" :key="e.id">
+        <td>{{e.id}}</td><td><span class="stamp bad">{{e.kind}}</span></td><td>{{e.detail}}</td><td>{{e.created_at}}</td>
+      </tr></tbody></table>
     </div>
   </div>`
 }).mount('#app');
